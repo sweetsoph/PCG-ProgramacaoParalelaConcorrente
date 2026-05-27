@@ -15,6 +15,7 @@
 #include <cmath>
 #include <iomanip>
 #include <cassert>
+#include <chrono>
 #include <omp.h>
 
 static constexpr int    DETECTION_ROWS  = 10;   // linhas usadas para detectar tipo
@@ -23,6 +24,24 @@ static constexpr char   DELIM           = ',';
 
 using Row = std::vector<std::string>;
 using Matrix = std::vector<Row>;
+
+using Clock = std::chrono::steady_clock;
+
+struct PhaseTimer {
+    std::string label;
+    Clock::time_point start;
+
+    explicit PhaseTimer(std::string phaseLabel)
+        : label(std::move(phaseLabel)), start(Clock::now()) {
+        std::cout << "[INICIO] " << label << "\n";
+    }
+
+    ~PhaseTimer() {
+        auto end = Clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        std::cout << "[FIM] " << label << " - " << elapsedMs << " ms\n";
+    }
+};
 
 enum class ColType { NUMERIC, CATEGORICAL, UNKNOWN };
 
@@ -184,6 +203,8 @@ void writeDictionary(const std::string& path,
 }
 
 int main(int argc, char* argv[]) {
+    auto programStart = Clock::now();
+
     if (argc < 2) {
         std::cerr << "Uso: " << argv[0] << " <dataset.csv> [num_threads]\n";
         return 1;
@@ -202,57 +223,61 @@ int main(int argc, char* argv[]) {
     }
 
     std::string headerLine;
-    if (!std::getline(inFile, headerLine)) {
-        std::cerr << "Arquivo vazio ou sem cabeçalho.\n";
-        return 1;
-    }
-    Row headers = parseLine(headerLine);
-    size_t numCols = headers.size();
-    std::cout << "Colunas detectadas: " << numCols << "\n";
-
+    Row headers;
+    size_t numCols = 0;
     Matrix sampleRows;
-    {
-        std::string line;
-        while (sampleRows.size() < DETECTION_ROWS && std::getline(inFile, line))
-            if (!line.empty())
-                sampleRows.push_back(parseLine(line));
-    }
-    if (sampleRows.empty()) {
-        std::cerr << "Dataset sem dados.\n";
-        return 1;
-    }
+    std::vector<ColType> colTypes;
 
-    std::vector<ColType> colTypes(numCols, ColType::UNKNOWN);
-    #pragma omp parallel for schedule(static)
-    for (int c = 0; c < static_cast<int>(numCols); ++c) {
-        int numericCount = 0;
-        for (auto& row : sampleRows) {
-            if (c < static_cast<int>(row.size()) && !row[c].empty()) {
-                if (isNumeric(row[c])) ++numericCount;
+    {
+        PhaseTimer phase("Leitura do cabecalho e amostras iniciais");
+        if (!std::getline(inFile, headerLine)) {
+            std::cerr << "Arquivo vazio ou sem cabeçalho.\n";
+            return 1;
+        }
+
+        headers = parseLine(headerLine);
+        numCols = headers.size();
+        std::cout << "Colunas detectadas: " << numCols << "\n";
+
+        std::string line;
+        while (sampleRows.size() < DETECTION_ROWS && std::getline(inFile, line)) {
+            if (!line.empty()) {
+                sampleRows.push_back(parseLine(line));
             }
         }
-        // se todos os valores não vazios forem numéricos, consideramos a coluna numérica
-        colTypes[c] = (numericCount == static_cast<int>(sampleRows.size()))
-                          ? ColType::NUMERIC
-                          : ColType::CATEGORICAL;
+
+        if (sampleRows.empty()) {
+            std::cerr << "Dataset sem dados.\n";
+            return 1;
+        }
+
+        colTypes.assign(numCols, ColType::UNKNOWN);
+        #pragma omp parallel for schedule(static)
+        for (int c = 0; c < static_cast<int>(numCols); ++c) {
+            int numericCount = 0;
+            for (auto& row : sampleRows) {
+                if (c < static_cast<int>(row.size()) && !row[c].empty()) {
+                    if (isNumeric(row[c])) ++numericCount;
+                }
+            }
+            colTypes[c] = (numericCount == static_cast<int>(sampleRows.size()))
+                              ? ColType::NUMERIC
+                              : ColType::CATEGORICAL;
+        }
+
+        std::cout << "\n=== Tipos de Colunas Detectados ===\n";
+        for (size_t c = 0; c < numCols; ++c) {
+            std::cout << "  " << std::setw(25) << std::left << headers[c]
+                      << (colTypes[c] == ColType::NUMERIC ? "NUMERICA" : "CATEGORICA") << "\n";
+        }
+        std::cout << "\n";
     }
 
-    std::cout << "\n=== Tipos de Colunas Detectados ===\n";
-    for (size_t c = 0; c < numCols; ++c) {
-        std::cout << "  " << std::setw(25) << std::left << headers[c]
-                  << (colTypes[c] == ColType::NUMERIC ? "NUMERICA" : "CATEGORICA") << "\n";
-    }
-    std::cout << "\n";
-
-    // colunas numéricas: vetores de valores (protegidos por mutex)
     std::vector<std::vector<double>> numValues(numCols);
     std::vector<std::mutex> numMutexes(numCols);
-
-    // colunas categóricas: dicionários (protegidos por mutex)
-    std::vector<CatDict>  catDicts(numCols);
+    std::vector<CatDict> catDicts(numCols);
     std::vector<std::mutex> catMutexes(numCols);
 
-    // remover extensão do arquivo de entrada para usar como prefixo
     std::string basePath = inputPath;
     {
         auto dot = basePath.rfind('.');
@@ -273,13 +298,12 @@ int main(int argc, char* argv[]) {
     BlockingQueue<IndexedLine> lineQueue(QUEUE_CAPACITY);
 
     std::map<size_t, std::string> pendingOutput;
-    std::mutex                    pendingMutex;
-    std::atomic<size_t>           nextWriteIdx{0};
+    std::mutex pendingMutex;
+    std::atomic<size_t> nextWriteIdx{0};
 
     auto processLine = [&](size_t idx, const std::string& rawLine) {
         Row row = parseLine(rawLine);
 
-        // Garantir tamanho correto
         while (row.size() < numCols) row.emplace_back("");
 
         Row outRow(numCols);
@@ -292,9 +316,8 @@ int main(int argc, char* argv[]) {
                     std::lock_guard<std::mutex> lk(numMutexes[c]);
                     numValues[c].push_back(d);
                 }
-                outRow[c] = val; // colunas numéricas mantêm o valor original
+                outRow[c] = val;
             } else {
-                // se for categórica, obter ou inserir no dicionário e usar o id como valor
                 int id;
                 {
                     std::lock_guard<std::mutex> lk(catMutexes[c]);
@@ -304,20 +327,17 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Montar linha de saída
         std::ostringstream oss;
         for (size_t c = 0; c < numCols; ++c) {
             if (c) oss << DELIM;
             oss << outRow[c];
         }
 
-        // Depositar na fila de saída ordenada
         {
             std::lock_guard<std::mutex> lk(pendingMutex);
             pendingOutput[idx] = oss.str();
         }
 
-        // Escrever todas as linhas consecutivas prontas
         while (true) {
             std::string lineToWrite;
             {
@@ -333,58 +353,66 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    for (size_t i = 0; i < sampleRows.size(); ++i) {
-        std::ostringstream oss;
-        for (size_t c = 0; c < sampleRows[i].size(); ++c) {
-            if (c) oss << DELIM;
-            oss << sampleRows[i][c];
+    {
+        PhaseTimer phase("Processamento das amostras iniciais");
+        for (size_t i = 0; i < sampleRows.size(); ++i) {
+            std::ostringstream oss;
+            for (size_t c = 0; c < sampleRows[i].size(); ++c) {
+                if (c) oss << DELIM;
+                oss << sampleRows[i][c];
+            }
+            processLine(i, oss.str());
         }
-        processLine(i, oss.str());
     }
+
     size_t startIdx = sampleRows.size();
-
     std::atomic<size_t> lineCounter{startIdx};
-    std::atomic<bool>   producerDone{false};
-
-    std::thread producerThread([&]() {
-        std::string line;
-        while (std::getline(inFile, line)) {
-            if (line.empty()) continue;
-            size_t idx = lineCounter.fetch_add(1, std::memory_order_relaxed);
-            lineQueue.push({idx, line});
-        }
-        lineQueue.close();
-        producerDone = true;
-    });
-
-    #pragma omp parallel
-    {
-        IndexedLine item;
-        while (lineQueue.pop(item)) {
-            processLine(item.first, item.second);
-        }
-    }
-
-    producerThread.join();
 
     {
-        std::lock_guard<std::mutex> lk(pendingMutex);
-        for (auto& [idx, lineStr] : pendingOutput)
-            outFile << lineStr << '\n';
-        pendingOutput.clear();
-    }
+        PhaseTimer phase("Leitura paralela e codificacao do restante");
+        std::thread producerThread([&]() {
+            std::string line;
+            while (std::getline(inFile, line)) {
+                if (line.empty()) continue;
+                size_t idx = lineCounter.fetch_add(1, std::memory_order_relaxed);
+                lineQueue.push({idx, line});
+            }
+            lineQueue.close();
+        });
 
-    outFile.close();
-    inFile.close();
+        #pragma omp parallel
+        {
+            IndexedLine item;
+            while (lineQueue.pop(item)) {
+                processLine(item.first, item.second);
+            }
+        }
+
+        producerThread.join();
+
+        {
+            std::lock_guard<std::mutex> lk(pendingMutex);
+            for (auto& [idx, lineStr] : pendingOutput) {
+                outFile << lineStr << '\n';
+            }
+            pendingOutput.clear();
+        }
+
+        outFile.close();
+        inFile.close();
+    }
 
     std::cout << "=== Estatísticas das Colunas Numéricas ===\n\n";
 
     std::vector<NumStats> stats(numCols);
-
-    #pragma omp parallel for schedule(dynamic)
-    for (int c = 0; c < static_cast<int>(numCols); ++c) {
-        if (colTypes[c] == ColType::NUMERIC)
-            stats[c] = computeStats(numValues[c]); // cópia intencional
+    {
+        PhaseTimer phase("Calculo das estatisticas numericas");
+        #pragma omp parallel for schedule(dynamic)
+        for (int c = 0; c < static_cast<int>(numCols); ++c) {
+            if (colTypes[c] == ColType::NUMERIC) {
+                stats[c] = computeStats(numValues[c]);
+            }
+        }
     }
 
     for (size_t c = 0; c < numCols; ++c) {
@@ -402,23 +430,31 @@ int main(int argc, char* argv[]) {
                   << "  IQR       : " << s.iqr      << "\n\n";
     }
 
-    std::cout << "=== Arquivos Dicionário Gerados ===\n";
-    #pragma omp parallel for schedule(dynamic)
-    for (int c = 0; c < static_cast<int>(numCols); ++c) {
-        if (colTypes[c] != ColType::CATEGORICAL) continue;
-        std::string dictPath = basePath + "_dict_" + headers[c] + ".csv";
-        for (char& ch : dictPath)
-            if (ch == ' ' || ch == '/' || ch == '\\') ch = '_';
-        writeDictionary(dictPath, headers[c], catDicts[c]);
-        #pragma omp critical
-        {
-            std::cout << "  " << headers[c] << " → " << dictPath
-                      << " (" << catDicts[c].valueToId.size() << " valores únicos)\n";
+    {
+        PhaseTimer phase("Geracao dos dicionarios categoricos");
+        std::cout << "=== Arquivos Dicionário Gerados ===\n";
+        #pragma omp parallel for schedule(dynamic)
+        for (int c = 0; c < static_cast<int>(numCols); ++c) {
+            if (colTypes[c] != ColType::CATEGORICAL) continue;
+            std::string dictPath = basePath + "_dict_" + headers[c] + ".csv";
+            for (char& ch : dictPath) {
+                if (ch == ' ' || ch == '/' || ch == '\\') ch = '_';
+            }
+            writeDictionary(dictPath, headers[c], catDicts[c]);
+            #pragma omp critical
+            {
+                std::cout << "  " << headers[c] << " → " << dictPath
+                          << " (" << catDicts[c].valueToId.size() << " valores únicos)\n";
+            }
         }
     }
 
+    auto programEnd = Clock::now();
+    auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(programEnd - programStart).count();
+
     std::cout << "\nDataset codificado salvo em: " << outputCsvPath << "\n";
     std::cout << "\nProcessamento concluído.\n";
+    std::cout << "Tempo total do programa: " << totalMs << " ms\n";
 
     return 0;
 }

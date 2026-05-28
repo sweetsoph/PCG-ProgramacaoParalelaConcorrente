@@ -18,62 +18,61 @@
 #include <chrono>
 #include <omp.h>
 
-static constexpr int    DETECTION_ROWS  = 10;   // linhas usadas para detectar tipo
-static constexpr size_t QUEUE_CAPACITY  = 512;  // tamanho máximo da fila produtor-consumidor
-static constexpr char   DELIM           = ',';
+static constexpr int QT_LINHAS_DETECTA_TIPO  = 10; 
+static constexpr size_t BUFFER_CAPACIDADE  = 512;
+static constexpr char DELIM  = ',';
 
-using Row = std::vector<std::string>;
-using Matrix = std::vector<Row>;
+using Linha = std::vector<std::string>;
+using Matriz = std::vector<Linha>;
 
 using Clock = std::chrono::steady_clock;
 
-struct PhaseTimer {
-    std::string label;
-    Clock::time_point start;
+struct TimerFase {
+    std::string texto;
+    Clock::time_point inicio;
 
-    explicit PhaseTimer(std::string phaseLabel)
-        : label(std::move(phaseLabel)), start(Clock::now()) {
-        std::cout << "[INICIO] " << label << "\n";
+    explicit TimerFase(std::string phaseLabel)
+        : texto(std::move(phaseLabel)), inicio(Clock::now()) {
+        std::cout << "[INICIO] " << texto << "\n";
     }
 
-    ~PhaseTimer() {
-        auto end = Clock::now();
-        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-        std::cout << "[FIM] " << label << " - " << elapsedMs << " ms\n";
+    ~TimerFase() {
+        auto fim = Clock::now();
+        auto msCalculado = std::chrono::duration_cast<std::chrono::milliseconds>(fim - inicio).count();
+        std::cout << "[FIM] " << texto << " - " << msCalculado << " ms\n";
     }
 };
 
-enum class ColType { NUMERIC, CATEGORICAL, UNKNOWN };
+enum class TipoColuna { NUMERICA, CATEGORICA, INDEFINIDO };
 
-// Estatísticas de coluna numérica
 struct NumStats {
-    double mean = 0.0;
-    double variance = 0.0;
-    double stddev = 0.0;
-    double median = 0.0;
+    double media = 0.0;
+    double variancia = 0.0;
+    double desvio_padrao = 0.0;
+    double mediana = 0.0;
     double q1 = 0.0;
     double q3 = 0.0;
     double iqr = 0.0;
-    size_t count = 0;
+    size_t qt_valores = 0;
 };
 
-// Dicionário de coluna categórica (valor => id)
-struct CatDict {
+// dicionário de coluna categórica (valor => id)
+struct DicioCategorica {
     std::unordered_map<std::string, int> valueToId;
-    int nextId = 0;
+    int proxId = 0;
 
-    int getOrInsert(const std::string& val) {
+    int getAndSetId(const std::string& val) {
         auto it = valueToId.find(val);
         if (it != valueToId.end()) return it->second;
-        valueToId[val] = nextId;
-        return nextId++;
+        valueToId[val] = proxId;
+        return proxId++;
     }
 };
 
 template<typename T>
-class BlockingQueue {
+class FilaBloqueante {
 public:
-    explicit BlockingQueue(size_t cap) : capacity_(cap), done_(false) {}
+    explicit FilaBloqueante(size_t cap) : capacity_(cap), done_(false) {}
 
     // produtor chama push(); retorna false se a fila foi encerrada
     bool push(T item) {
@@ -96,7 +95,7 @@ public:
         return true;
     }
 
-    // Sinaliza que o produtor terminou de inserir
+    // sinaliza que o produtor terminou de inserir
     void close() {
         std::unique_lock<std::mutex> lk(mtx_);
         done_ = true;
@@ -107,32 +106,32 @@ public:
     bool isDone() const { return done_; }
 
 private:
-    std::queue<T>           queue_;
-    std::mutex              mtx_;
+    std::queue<T> queue_;
+    std::mutex mtx_;
     std::condition_variable cv_push_, cv_pop_;
-    size_t                  capacity_;
-    bool                    done_;
+    size_t capacity_;
+    bool done_;
 };
 
-// divide uma linha CSV respeitando aspas
-Row parseLine(const std::string& line) {
-    Row fields;
-    std::string field;
-    bool inQuotes = false;
+// divide uma linha CSV em campos, respeitando aspas
+Linha getDadosLinha(const std::string& line) {
+    Linha campos;
+    std::string campoAtual;
+    bool entreAspas = false;
 
     for (size_t i = 0; i < line.size(); ++i) {
         char c = line[i];
         if (c == '"') {
-            inQuotes = !inQuotes;
-        } else if (c == DELIM && !inQuotes) {
-            fields.push_back(field);
-            field.clear();
+            entreAspas = !entreAspas;
+        } else if (c == DELIM && !entreAspas) {
+            campos.push_back(campoAtual);
+            campoAtual.clear();
         } else {
-            field += c;
+            campoAtual += c;
         }
     }
-    fields.push_back(field);
-    return fields;
+    campos.push_back(campoAtual);
+    return campos;
 }
 
 // verifica se uma string pode ser interpretada como número
@@ -143,52 +142,52 @@ bool isNumeric(const std::string& s) {
     return end != s.c_str() && *end == '\0';
 }
 
-double percentile(std::vector<double>& sorted, double p) {
+double percentil(std::vector<double>& sorted, double p) {
     if (sorted.empty()) return 0.0;
     double idx = p * (static_cast<double>(sorted.size()) - 1.0);
-    size_t lo  = static_cast<size_t>(std::floor(idx));
-    size_t hi  = static_cast<size_t>(std::ceil(idx));
-    if (lo == hi) return sorted[lo];
-    return sorted[lo] + (idx - lo) * (sorted[hi] - sorted[lo]);
+    size_t min = static_cast<size_t>(std::floor(idx));
+    size_t max = static_cast<size_t>(std::ceil(idx));
+    if (min == max) return sorted[min];
+    return sorted[min] + (idx - min) * (sorted[max] - sorted[min]);
 }
 
 NumStats computeStats(std::vector<double> values) {
     NumStats s;
-    s.count = values.size();
-    if (s.count == 0) return s;
+    s.qt_valores = values.size();
+    if (s.qt_valores == 0) return s;
 
-    // Média em paralelo
+    // média em paralelo
     double sum = 0.0;
     #pragma omp parallel for reduction(+:sum) schedule(static)
     for (int i = 0; i < static_cast<int>(values.size()); ++i)
         sum += values[i];
-    s.mean = sum / static_cast<double>(s.count);
+    s.media = sum / static_cast<double>(s.qt_valores);
 
-    // Variância em paralelo
+    // variância em paralelo
     double varSum = 0.0;
     #pragma omp parallel for reduction(+:varSum) schedule(static)
     for (int i = 0; i < static_cast<int>(values.size()); ++i) {
-        double d = values[i] - s.mean;
+        double d = values[i] - s.media;
         varSum += d * d;
     }
-    s.variance = varSum / static_cast<double>(s.count);
-    s.stddev   = std::sqrt(s.variance);
+    s.variancia = varSum / static_cast<double>(s.qt_valores);
+    s.desvio_padrao = std::sqrt(s.variancia);
 
     std::sort(values.begin(), values.end());
-    s.median = percentile(values, 0.50);
-    s.q1     = percentile(values, 0.25);
-    s.q3     = percentile(values, 0.75);
-    s.iqr    = s.q3 - s.q1;
+    s.mediana = percentil(values, 0.50);
+    s.q1 = percentil(values, 0.25);
+    s.q3 = percentil(values, 0.75);
+    s.iqr = s.q3 - s.q1;
 
     return s;
 }
 
-void writeDictionary(const std::string& path,
+void escreverDicionario(const std::string& path,
                      const std::string& colName,
-                     const CatDict& dict) {
+                     const DicioCategorica& dict) {
     std::ofstream f(path);
     if (!f.is_open()) {
-        std::cerr << "[AVISO] Não foi possível criar dicionário: " << path << "\n";
+        std::cerr << "[AVISO] Não foi possível criar dicionario: " << path << "\n";
         return;
     }
     f << "id,valor\n";
@@ -203,132 +202,132 @@ void writeDictionary(const std::string& path,
 }
 
 int main(int argc, char* argv[]) {
-    auto programStart = Clock::now();
+    auto iniciaPrograma = Clock::now();
 
     if (argc < 2) {
         std::cerr << "Uso: " << argv[0] << " <dataset.csv> [num_threads]\n";
         return 1;
     }
 
-    const std::string inputPath = argv[1];
-    int numThreads = (argc >= 3) ? std::stoi(argv[2]) : omp_get_max_threads();
-    omp_set_num_threads(numThreads);
+    const std::string caminhoArquivo = argv[1];
+    int qt_threads = (argc >= 3) ? std::stoi(argv[2]) : omp_get_max_threads();
+    omp_set_num_threads(qt_threads);
 
-    std::cout << "Threads OpenMP: " << numThreads << "\n";
+    std::cout << "Threads OpenMP: " << qt_threads << "\n";
 
-    std::ifstream inFile(inputPath);
+    std::ifstream inFile(caminhoArquivo);
     if (!inFile.is_open()) {
-        std::cerr << "Erro ao abrir o arquivo: " << inputPath << "\n";
+        std::cerr << "Erro ao abrir o arquivo: " << caminhoArquivo << "\n";
         return 1;
     }
 
-    std::string headerLine;
-    Row headers;
-    size_t numCols = 0;
-    Matrix sampleRows;
-    std::vector<ColType> colTypes;
+    std::string cabecalho;
+    Linha cabecalhoItens;
+    size_t qtColunas = 0;
+    Matriz linhasExemplo;
+    std::vector<TipoColuna> tiposColunas;
 
     {
-        PhaseTimer phase("Leitura do cabecalho e amostras iniciais");
-        if (!std::getline(inFile, headerLine)) {
+        TimerFase fase("Leitura do cabecalho e amostras iniciais");
+        if (!std::getline(inFile, cabecalho)) {
             std::cerr << "Arquivo vazio ou sem cabeçalho.\n";
             return 1;
         }
 
-        headers = parseLine(headerLine);
-        numCols = headers.size();
-        std::cout << "Colunas detectadas: " << numCols << "\n";
+        cabecalhoItens = getDadosLinha(cabecalho);
+        qtColunas = cabecalhoItens.size();
+        std::cout << "Colunas detectadas: " << qtColunas << "\n";
 
-        std::string line;
-        while (sampleRows.size() < DETECTION_ROWS && std::getline(inFile, line)) {
-            if (!line.empty()) {
-                sampleRows.push_back(parseLine(line));
+        std::string linha;
+        while (linhasExemplo.size() < QT_LINHAS_DETECTA_TIPO && std::getline(inFile, linha)) {
+            if (!linha.empty()) {
+                linhasExemplo.push_back(getDadosLinha(linha));
             }
         }
 
-        if (sampleRows.empty()) {
+        if (linhasExemplo.empty()) {
             std::cerr << "Dataset sem dados.\n";
             return 1;
         }
 
-        colTypes.assign(numCols, ColType::UNKNOWN);
+        tiposColunas.assign(qtColunas, TipoColuna::INDEFINIDO);
         #pragma omp parallel for schedule(static)
-        for (int c = 0; c < static_cast<int>(numCols); ++c) {
+        for (int c = 0; c < static_cast<int>(qtColunas); ++c) {
             int numericCount = 0;
-            for (auto& row : sampleRows) {
+            for (auto& row : linhasExemplo) {
                 if (c < static_cast<int>(row.size()) && !row[c].empty()) {
                     if (isNumeric(row[c])) ++numericCount;
                 }
             }
-            colTypes[c] = (numericCount == static_cast<int>(sampleRows.size()))
-                              ? ColType::NUMERIC
-                              : ColType::CATEGORICAL;
+            tiposColunas[c] = (numericCount == static_cast<int>(linhasExemplo.size()))
+                              ? TipoColuna::NUMERICA
+                              : TipoColuna::CATEGORICA;
         }
 
         std::cout << "\n=== Tipos de Colunas Detectados ===\n";
-        for (size_t c = 0; c < numCols; ++c) {
-            std::cout << "  " << std::setw(25) << std::left << headers[c]
-                      << (colTypes[c] == ColType::NUMERIC ? "NUMERICA" : "CATEGORICA") << "\n";
+        for (size_t c = 0; c < qtColunas; ++c) {
+            std::cout << "  " << std::setw(25) << std::left << cabecalhoItens[c]
+                      << (tiposColunas[c] == TipoColuna::NUMERICA ? "NUMERICA" : "CATEGORICA") << "\n";
         }
         std::cout << "\n";
     }
 
-    std::vector<std::vector<double>> numValues(numCols);
-    std::vector<std::mutex> numMutexes(numCols);
-    std::vector<CatDict> catDicts(numCols);
-    std::vector<std::mutex> catMutexes(numCols);
+    std::vector<std::vector<double>> valNumericos(qtColunas);
+    std::vector<std::mutex> mutexNumericos(qtColunas);
+    std::vector<DicioCategorica> diciosCategoricos(qtColunas);
+    std::vector<std::mutex> mutexCategoricos(qtColunas);
 
-    std::string basePath = inputPath;
+    std::string arquivoFinal = caminhoArquivo;
     {
-        auto dot = basePath.rfind('.');
-        if (dot != std::string::npos) basePath = basePath.substr(0, dot);
+        auto dot = arquivoFinal.rfind('.');
+        if (dot != std::string::npos) arquivoFinal = arquivoFinal.substr(0, dot);
     }
-    const std::string outputCsvPath = basePath + "_encoded.csv";
+    const std::string caminhoArquivoSaida = arquivoFinal + "_encoded.csv";
 
-    std::ofstream outFile(outputCsvPath);
-    if (!outFile.is_open()) {
-        std::cerr << "Não foi possível criar arquivo de saída: " << outputCsvPath << "\n";
+    std::ofstream arquivoSaida(caminhoArquivoSaida);
+    if (!arquivoSaida.is_open()) {
+        std::cerr << "Não foi possível criar arquivo de saída: " << caminhoArquivoSaida << "\n";
         return 1;
     }
-    outFile << headerLine << '\n';
+    arquivoSaida << cabecalho << '\n';
 
     std::mutex outMutex;
 
     using IndexedLine = std::pair<size_t, std::string>;
-    BlockingQueue<IndexedLine> lineQueue(QUEUE_CAPACITY);
+    FilaBloqueante<IndexedLine> lineQueue(BUFFER_CAPACIDADE);
 
     std::map<size_t, std::string> pendingOutput;
     std::mutex pendingMutex;
     std::atomic<size_t> nextWriteIdx{0};
 
     auto processLine = [&](size_t idx, const std::string& rawLine) {
-        Row row = parseLine(rawLine);
+        Linha row = getDadosLinha(rawLine);
 
-        while (row.size() < numCols) row.emplace_back("");
+        while (row.size() < qtColunas) row.emplace_back("");
 
-        Row outRow(numCols);
+        Linha outRow(qtColunas);
 
-        for (size_t c = 0; c < numCols; ++c) {
+        for (size_t c = 0; c < qtColunas; ++c) {
             const std::string& val = row[c];
-            if (colTypes[c] == ColType::NUMERIC) {
+            if (tiposColunas[c] == TipoColuna::NUMERICA) {
                 if (isNumeric(val)) {
                     double d = std::stod(val);
-                    std::lock_guard<std::mutex> lk(numMutexes[c]);
-                    numValues[c].push_back(d);
+                    std::lock_guard<std::mutex> lk(mutexNumericos[c]);
+                    valNumericos[c].push_back(d);
                 }
                 outRow[c] = val;
             } else {
                 int id;
                 {
-                    std::lock_guard<std::mutex> lk(catMutexes[c]);
-                    id = catDicts[c].getOrInsert(val);
+                    std::lock_guard<std::mutex> lk(mutexCategoricos[c]);
+                    id = diciosCategoricos[c].getAndSetId(val);
                 }
                 outRow[c] = std::to_string(id);
             }
         }
 
         std::ostringstream oss;
-        for (size_t c = 0; c < numCols; ++c) {
+        for (size_t c = 0; c < qtColunas; ++c) {
             if (c) oss << DELIM;
             oss << outRow[c];
         }
@@ -349,27 +348,27 @@ int main(int argc, char* argv[]) {
                 ++nextWriteIdx;
             }
             std::lock_guard<std::mutex> lk(outMutex);
-            outFile << lineToWrite << '\n';
+            arquivoSaida << lineToWrite << '\n';
         }
     };
 
     {
-        PhaseTimer phase("Processamento das amostras iniciais");
-        for (size_t i = 0; i < sampleRows.size(); ++i) {
+        TimerFase fase("Processamento das amostras iniciais");
+        for (size_t i = 0; i < linhasExemplo.size(); ++i) {
             std::ostringstream oss;
-            for (size_t c = 0; c < sampleRows[i].size(); ++c) {
+            for (size_t c = 0; c < linhasExemplo[i].size(); ++c) {
                 if (c) oss << DELIM;
-                oss << sampleRows[i][c];
+                oss << linhasExemplo[i][c];
             }
             processLine(i, oss.str());
         }
     }
 
-    size_t startIdx = sampleRows.size();
+    size_t startIdx = linhasExemplo.size();
     std::atomic<size_t> lineCounter{startIdx};
 
     {
-        PhaseTimer phase("Leitura paralela e codificacao do restante");
+        TimerFase fase("Leitura paralela e codificacao do restante");
         std::thread producerThread([&]() {
             std::string line;
             while (std::getline(inFile, line)) {
@@ -393,67 +392,67 @@ int main(int argc, char* argv[]) {
         {
             std::lock_guard<std::mutex> lk(pendingMutex);
             for (auto& [idx, lineStr] : pendingOutput) {
-                outFile << lineStr << '\n';
+                arquivoSaida << lineStr << '\n';
             }
             pendingOutput.clear();
         }
 
-        outFile.close();
+        arquivoSaida.close();
         inFile.close();
     }
 
     std::cout << "=== Estatísticas das Colunas Numéricas ===\n\n";
 
-    std::vector<NumStats> stats(numCols);
+    std::vector<NumStats> stats(qtColunas);
     {
-        PhaseTimer phase("Calculo das estatisticas numericas");
+        TimerFase fase("Calculo das estatisticas numericas");
         #pragma omp parallel for schedule(dynamic)
-        for (int c = 0; c < static_cast<int>(numCols); ++c) {
-            if (colTypes[c] == ColType::NUMERIC) {
-                stats[c] = computeStats(numValues[c]);
+        for (int c = 0; c < static_cast<int>(qtColunas); ++c) {
+            if (tiposColunas[c] == TipoColuna::NUMERICA) {
+                stats[c] = computeStats(valNumericos[c]);
             }
         }
     }
 
-    for (size_t c = 0; c < numCols; ++c) {
-        if (colTypes[c] != ColType::NUMERIC) continue;
+    for (size_t c = 0; c < qtColunas; ++c) {
+        if (tiposColunas[c] != TipoColuna::NUMERICA) continue;
         const NumStats& s = stats[c];
         std::cout << std::fixed << std::setprecision(4);
-        std::cout << "Coluna: " << headers[c] << "\n"
-                  << "  Registros : " << s.count    << "\n"
-                  << "  Média     : " << s.mean     << "\n"
-                  << "  Mediana   : " << s.median   << "\n"
-                  << "  Variância : " << s.variance << "\n"
-                  << "  Desvio Pad: " << s.stddev   << "\n"
-                  << "  Q1        : " << s.q1       << "\n"
-                  << "  Q3        : " << s.q3       << "\n"
-                  << "  IQR       : " << s.iqr      << "\n\n";
+        std::cout << "Coluna: " << cabecalhoItens[c] << "\n"
+                  << "  Registros  : " << s.qt_valores    << "\n"
+                  << "  Media      : " << s.media     << "\n"
+                  << "  Mediana    : " << s.mediana   << "\n"
+                  << "  Variancia  : " << s.variancia << "\n"
+                  << "  Desvio Pad : " << s.desvio_padrao   << "\n"
+                  << "  Q1         : " << s.q1       << "\n"
+                  << "  Q3         : " << s.q3       << "\n"
+                  << "  IQR        : " << s.iqr      << "\n\n";
     }
 
     {
-        PhaseTimer phase("Geracao dos dicionarios categoricos");
-        std::cout << "=== Arquivos Dicionário Gerados ===\n";
+        TimerFase fase("Geracao dos dicionarios categoricos");
+        std::cout << "=== Arquivos Dicionario Gerados ===\n";
         #pragma omp parallel for schedule(dynamic)
-        for (int c = 0; c < static_cast<int>(numCols); ++c) {
-            if (colTypes[c] != ColType::CATEGORICAL) continue;
-            std::string dictPath = basePath + "_dict_" + headers[c] + ".csv";
+        for (int c = 0; c < static_cast<int>(qtColunas); ++c) {
+            if (tiposColunas[c] != TipoColuna::CATEGORICA) continue;
+            std::string dictPath = arquivoFinal + "_dict_" + cabecalhoItens[c] + ".csv";
             for (char& ch : dictPath) {
                 if (ch == ' ' || ch == '/' || ch == '\\') ch = '_';
             }
-            writeDictionary(dictPath, headers[c], catDicts[c]);
+            escreverDicionario(dictPath, cabecalhoItens[c], diciosCategoricos[c]);
             #pragma omp critical
             {
-                std::cout << "  " << headers[c] << " → " << dictPath
-                          << " (" << catDicts[c].valueToId.size() << " valores únicos)\n";
+                std::cout << "  " << cabecalhoItens[c] << " → " << dictPath
+                          << " (" << diciosCategoricos[c].valueToId.size() << " valores unicos)\n";
             }
         }
     }
 
     auto programEnd = Clock::now();
-    auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(programEnd - programStart).count();
+    auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(programEnd - iniciaPrograma).count();
 
-    std::cout << "\nDataset codificado salvo em: " << outputCsvPath << "\n";
-    std::cout << "\nProcessamento concluído.\n";
+    std::cout << "\nDataset codificado salvo em: " << caminhoArquivoSaida << "\n";
+    std::cout << "\nProcessamento concluido.\n";
     std::cout << "Tempo total do programa: " << totalMs << " ms\n";
 
     return 0;
